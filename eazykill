@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""eazykill — list open macOS GUI apps and quit/force-quit them.
+
+Keys:
+    arrows        move selection
+    /             search/filter by name
+    k             graceful quit
+    K / Ctrl-K    force quit (SIGKILL)
+    q / Esc       exit
+
+The terminal that launched this is hidden from the list so you can't
+accidentally quit the very thing running it.
+"""
+
+import curses
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+SPIN = ['|', '/', '-', '\\']
+CTRL_K = 11  # keycode for Ctrl-K
+
+
+def parse_lsappinfo(text):
+    """Parse `lsappinfo list` output into per-app dicts.
+
+    Keys: name, pid, bundle, type, launch. ``launch`` is taken from
+    'launch time' when present, otherwise 'checkin time' (launchd-managed
+    apps like Finder only report the latter).
+    """
+    apps = []
+    cur = None
+    for line in text.splitlines():
+        m = re.match(r'^\s*\d+\)\s+"([^"]+)"\s+ASN:', line)
+        if m:
+            if cur:
+                apps.append(cur)
+            cur = {'name': m.group(1), 'pid': None, 'bundle': None,
+                   'type': None, 'launch': None}
+            continue
+        if cur is None:
+            continue
+        mp = re.search(r'pid = (\d+)', line)
+        if mp:
+            cur['pid'] = int(mp.group(1))
+        mb = re.search(r'bundleID="([^"]+)"', line)
+        if mb:
+            cur['bundle'] = mb.group(1)
+        mt = re.search(r'type="([^"]+)"', line)
+        if mt:
+            cur['type'] = mt.group(1)
+        if 'time =' in line and cur['launch'] is None:
+            ml = re.search(r'\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}', line)
+            if ml:
+                cur['launch'] = ml.group(0)
+    if cur:
+        apps.append(cur)
+    return apps
+
+
+def list_apps():
+    """Foreground (Dock) apps from LaunchServices, with PID + launch time."""
+    r = subprocess.run(['lsappinfo', 'list'], capture_output=True, text=True)
+    out = []
+    for a in parse_lsappinfo(r.stdout):
+        if a.get('type') != 'Foreground' or not a.get('pid') or not a.get('launch'):
+            continue
+        a['ago'] = relative(a['launch'])
+        out.append(a)
+    return out
+
+
+def relative(launch):
+    lt = datetime.strptime(launch, '%Y/%m/%d %H:%M:%S')
+    secs = int((datetime.now() - lt).total_seconds())
+    if secs < 0:
+        secs = 0
+    if secs >= 86400:
+        d = secs // 86400
+        return '%d day%s ago' % (d, '' if d == 1 else 's')
+    if secs >= 3600:
+        h = secs // 3600
+        return '%d hour%s ago' % (h, '' if h == 1 else 's')
+    if secs >= 60:
+        m = secs // 60
+        return '%d minute%s ago' % (m, '' if m == 1 else 's')
+    return 'just now'
+
+
+def ancestor_pids():
+    """PIDs of every process between this one and launchd (inclusive)."""
+    pid = os.getpid()
+    pids = set()
+    for _ in range(64):
+        if pid <= 1:
+            break
+        pids.add(pid)
+        r = subprocess.run(['ps', '-p', str(pid), '-o', 'ppid='],
+                           capture_output=True, text=True)
+        try:
+            pid = int(r.stdout.strip())
+        except ValueError:
+            break
+    return pids
+
+
+def refresh():
+    apps = list_apps()
+    hide = ancestor_pids()
+    return [a for a in apps if a['pid'] not in hide]
+
+
+def quit_app(app):
+    if app.get('bundle') and app['bundle'] != '[ NULL ]':
+        script = 'tell application id "%s" to quit' % \
+            app['bundle'].replace('"', '\\"')
+    else:
+        script = 'quit app "%s"' % app['name'].replace('"', '\\"')
+    try:
+        r = subprocess.run(['osascript', '-e', script],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return False, 'timed out waiting for app to quit'
+    if r.returncode == 0:
+        return True, ''
+    return False, (r.stderr or '').strip() or 'quit failed'
+
+
+def force_quit(pid):
+    os.kill(pid, signal.SIGKILL)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _do_quit(app, result):
+    ok, err = quit_app(app)
+    if ok:
+        # confirm the process actually exited (some apps quit slowly or
+        # accept the event without exiting)
+        for _ in range(30):
+            if not pid_alive(app['pid']):
+                result['ok'] = True
+                result['err'] = ''
+                return
+            time.sleep(0.1)
+        result['ok'] = False
+        result['err'] = "didn't quit — press K to force kill"
+        return
+    result['ok'] = False
+    result['err'] = err
+
+
+def _do_force(app, result):
+    try:
+        force_quit(app['pid'])
+        result['ok'] = True
+    except ProcessLookupError:
+        result['ok'] = True
+    except PermissionError as e:
+        result['ok'] = False
+        result['err'] = str(e)
+
+
+def start_quit(app):
+    result = {}
+    t = threading.Thread(target=_do_quit, args=(app, result), daemon=True)
+    t.start()
+    return {'label': 'quitting', 'thread': t,
+            'result': result, 'done': 'quit %s', 'target': app}
+
+
+def start_force(app):
+    result = {}
+    t = threading.Thread(target=_do_force, args=(app, result), daemon=True)
+    t.start()
+    return {'label': 'killing', 'thread': t,
+            'result': result, 'done': 'killed %s', 'target': app}
+
+
+def filtered(apps, query):
+    q = query.lower()
+    return [a for a in apps if q in a['name'].lower()]
+
+
+def draw(stdscr, apps, sel, query, mode, status, busy=None):
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    stdscr.addnstr(0, 0,
+                   " k:quit   K/Ctrl-K:force   /:search   q:exit", w - 1)
+    stdscr.addnstr(1, 0,
+                   " APP                        PID   OPENED", w - 1)
+    rows = h - 3
+    top = 0
+    if sel >= rows:
+        top = sel - rows + 1
+    for i in range(rows):
+        idx = top + i
+        if idx >= len(apps):
+            break
+        a = apps[idx]
+        line = " %-26.26s %7d  %s" % (a['name'], a['pid'], a['ago'])
+        if busy and idx == sel:
+            line += "  " + busy
+        attr = curses.A_REVERSE if idx == sel else 0
+        try:
+            stdscr.addnstr(2 + i, 0, line, w - 1, attr)
+        except curses.error:
+            pass
+    foot = ''
+    if mode == 'filter':
+        foot = '/' + query + '  (Enter=done  Esc=clear)'
+    elif status:
+        foot = status
+    elif apps:
+        foot = '%d app%s' % (len(apps), '' if len(apps) == 1 else 's')
+    try:
+        stdscr.addnstr(h - 1, 0, foot, w - 1)
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+
+def _run(stdscr, apps):
+    curses.curs_set(0)
+    sel = 0
+    query = ''
+    mode = 'list'
+    status = ''
+    busy = None
+    spin = 0
+    while True:
+        cur = filtered(apps, query)
+        if not cur:
+            sel = 0
+        elif sel >= len(cur):
+            sel = len(cur) - 1
+
+        if busy is not None:
+            if not busy['thread'].is_alive():
+                r = busy['result']
+                a = busy['target']
+                if r.get('ok'):
+                    status = busy['done'] % a['name']
+                else:
+                    status = 'failed: %s' % (r.get('err') or 'error')
+                busy = None
+                apps = refresh()
+                stdscr.timeout(-1)
+                continue
+            draw(stdscr, cur, sel, query, mode, status,
+                 busy['label'] + ' ' + SPIN[spin])
+            spin = (spin + 1) % len(SPIN)
+            stdscr.timeout(80)
+            c = stdscr.getch()
+            if c in (3, ord('q')):
+                stdscr.timeout(-1)
+                return
+            continue
+
+        draw(stdscr, cur, sel, query, mode, status)
+        try:
+            c = stdscr.getch()
+        except KeyboardInterrupt:
+            return
+        if c == -1:
+            continue
+        status = ''
+        if c == curses.KEY_RESIZE:
+            continue
+        if mode == 'filter':
+            if c == 27:
+                query = ''
+                mode = 'list'
+            elif c in (10, 13):
+                mode = 'list'
+            elif c in (127, 8, curses.KEY_BACKSPACE):
+                query = query[:-1]
+            elif c == 3:
+                return
+            elif 32 <= c <= 126:
+                query += chr(c)
+                sel = 0
+            elif c == curses.KEY_UP:
+                sel = max(0, sel - 1)
+            elif c == curses.KEY_DOWN:
+                sel = min(len(cur) - 1, sel + 1) if cur else 0
+            continue
+        if c in (ord('q'), 27, 3):
+            return
+        if c == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif c == curses.KEY_DOWN:
+            sel = min(len(cur) - 1, sel + 1) if cur else 0
+        elif c == ord('/'):
+            mode = 'filter'
+        elif c == ord('k') and cur:
+            busy = start_quit(cur[sel])
+        elif c in (ord('K'), CTRL_K) and cur:
+            busy = start_force(cur[sel])
+
+
+def main():
+    if sys.platform != 'darwin':
+        sys.stderr.write('eazykill: macOS only for now\n')
+        return 1
+    apps = refresh()
+    if not apps:
+        sys.stderr.write('eazykill: no open GUI apps\n')
+        return 1
+    curses.wrapper(_run, apps)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
